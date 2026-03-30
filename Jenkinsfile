@@ -11,7 +11,7 @@ pipeline {
 
         stage('Clone Code') {
             steps {
-                git 'https://github.com/your-username/bot-app.git'
+                git 'https://github.com/ARPITDIXIT789/PATCH-BOT.git'
             }
         }
 
