@@ -3,10 +3,8 @@ import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
 
-# Bot token
-BOT_TOKEN = "8774571585:AAFKay-2UKHotwYLEOu2NxF0Y9YvY6I7zuk"
+BOT_TOKEN = "8774571585:AAFKay-2UKHotwYLEOu2NxF0Y9YvY6I7zuk"  # Full token dalo
 
-# Logging setup
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -17,7 +15,6 @@ class PatchParser:
         self.extra_offsets = []
         
     def parse_input(self, text):
-        """Parse the input text and extract patches, hooks, and extra offsets"""
         self.patches.clear()
         self.hooks.clear()
         self.extra_offsets.clear()
@@ -53,34 +50,30 @@ class PatchParser:
                     offset = match.group(2).upper()
                     self.hooks.append((lib, offset))
         
-        # Parse extra offsets (standalone lines)
+        # Parse extra offsets
         for line in lines:
             line = line.strip()
-            # Pattern 1: libname - offset hex_value
             match1 = re.match(r'(\S+)\s*-\s*0x([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)', line)
             if match1:
                 lib = match1.group(1)
                 offset = match1.group(2).upper()
                 patch_hex = match1.group(3)
-                self.extra_offsets.append(('extra', offset, patch_hex))
+                self.extra_offsets.append((lib, offset, patch_hex))
                 continue
             
-            # Pattern 2: offset HOOK OFFSET
             match2 = re.match(r'0x([0-9A-Fa-f]+)\s+HOOK OFFSET', line)
             if match2:
                 offset = match2.group(1).upper()
                 self.hooks.append(('unknown', offset))
                 continue
             
-            # Pattern 3: offset patch_hex
             match3 = re.match(r'0x([0-9A-Fa-f]+)\s+([0-9A-Fa-f]+)', line)
             if match3:
                 offset = match3.group(1).upper()
-                patch_hex = match3.group(2)
+                patch_hex = match3.group(3)
                 self.extra_offsets.append(('extra', offset, patch_hex))
     
     def generate_patch_lib(self, lib_filter=None):
-        """Generate PATCH_LIB format for patches"""
         result = []
         for lib, offset, patch_hex in self.patches:
             if lib_filter and lib != lib_filter:
@@ -89,132 +82,103 @@ class PatchParser:
         return result
     
     def get_hooks(self):
-        """Get hook offsets"""
         return [(lib, offset) for lib, offset in self.hooks]
     
     def get_extra_offsets(self):
-        """Get extra offsets"""
         return self.extra_offsets
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command handler"""
-    await update.message.reply_text(
-        "🎯 **Patch Offset Parser Bot**\n\n"
-        "Input bhejo jo tumhare paas hai (PATCH LIST, HOOK LIST wala text), "
-        "main automatically parse kar ke PATCH_LIB format mein convert kar dunga!\n\n"
-        "Example:\n"
-        "```\n"
-        "--- [ PATCH LIST ] ---\n"
-        "Patch Found: libanogs.so -> 0x2234B0 [h 00 00 80 D2 C0 03 5F D6]\n"
-        "--- [ HOOK LIST ] ---\n"
-        "Hook Found: libanogs.so -> 0x2328F0\n"
-        "```",
-        parse_mode='Markdown'
-    )
+    welcome_text = """
+🎯 Patch Offset Parser Bot
+
+Input bhejo (PATCH LIST, HOOK LIST wala text), 
+main PATCH_LIB format mein convert kar dunga!
+
+Example:
+--- [ PATCH LIST ] ---
+Patch Found: libanogs.so -> 0x2234B0 [h 00 00 80 D2 C0 03 5F D6]
+--- [ HOOK LIST ] ---
+Hook Found: libanogs.so -> 0x2328F0
+    """
+    await update.message.reply_text(welcome_text)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle input messages"""
     parser = PatchParser()
     parser.parse_input(update.message.text)
     
-    # Patch LIB generation
     patches = parser.generate_patch_lib()
     hooks = parser.get_hooks()
     extra_offsets = parser.get_extra_offsets()
     
-    response = "📋 **Parsed Results:**\n\n"
+    response = "📋 Parsed Results:\n\n"
     
     if patches:
-        response += "🔧 **PATCH LIB Code:**\n```\n"
-        response += '\n'.join(patches)
-        response += "\n```\n\n"
+        response += "🔧 PATCH LIB Code:\n"
+        for patch in patches:
+            response += f"```{patch}```\n"
     
     if hooks:
-        response += "🎣 **HOOK Offsets:**\n"
+        response += "\n🎣 HOOK Offsets:\n"
         for lib, offset in hooks:
             lib_display = lib if lib != 'unknown' else '?'
-            response += f"• `{lib_display}` -> `0x{offset}`\n"
-        response += "\n"
+            response += f"• {lib_display} -> 0x{offset}\n"
     
     if extra_offsets:
-        response += "📍 **Extra Offsets:**\n"
-        for _, offset, hex_val in extra_offsets:
-            response += f"• `0x{offset}` -> `{hex_val}`\n"
+        response += "\n📍 Extra Offsets:\n"
+        for lib, offset, hex_val in extra_offsets:
+            response += f"• 0x{offset} -> {hex_val}\n"
     
     if not patches and not hooks and not extra_offsets:
-        response += "❌ Koi valid data nahi mila. Dobara try karo!"
+        response += "❌ Koi valid data nahi mila!"
     
-    # Add patch options button
-    keyboard = [[InlineKeyboardButton("✏️ Patch Options (RET/NOP)", callback_data="patch_options")]]
+    keyboard = [[InlineKeyboardButton("✏️ Patch Options", callback_data="patch_options")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    await update.message.reply_text(response, parse_mode='Markdown', reply_markup=reply_markup)
+    await update.message.reply_text(response, reply_markup=reply_markup, parse_mode=None)
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button callbacks"""
     query = update.callback_query
     await query.answer()
     
     if query.data == "patch_options":
         keyboard = [
-            [InlineKeyboardButton("RET (C0 03 5F D6)", callback_data="patch_ret")],
-            [InlineKeyboardButton("RET0 (00 00 80 D2)", callback_data="patch_ret0")],
-            [InlineKeyboardButton("NOP (1F 20 03 D5)", callback_data="patch_nop")],
-            [InlineKeyboardButton("🔙 Back", callback_data="back")]
+            [InlineKeyboardButton("RET", callback_data="patch_ret")],
+            [InlineKeyboardButton("RET0", callback_data="patch_ret0")],
+            [InlineKeyboardButton("NOP", callback_data="patch_nop")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         await query.edit_message_text(
-            "⚙️ **Patch Value Select karo:**\n\n"
-            "Yahan se sare offsets ko ek specific patch value se replace kar sakte ho:",
-            parse_mode='Markdown',
+            "⚙️ Patch Value select karo:\n"
+            "RET: C0 03 5F D6\n"
+            "RET0: 00 00 80 D2\n"
+            "NOP: 1F 20 03 D5",
             reply_markup=reply_markup
         )
 
 async def patch_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle patch selection"""
     query = update.callback_query
     await query.answer()
     
-    parser = PatchParser()
-    # Re-parse from last message (simplified - in production store context)
-    parser.parse_input(context.user_data.get('last_input', ''))
-    
+    # Simple response for now
     patch_map = {
         'patch_ret': 'C0 03 5F D6',
-        'patch_ret0': '00 00 80 D2',
+        'patch_ret0': '00 00 80 D2', 
         'patch_nop': '1F 20 03 D5'
     }
     
     if query.data in patch_map:
         patch_hex = patch_map[query.data]
-        patches = []
-        
-        # Apply to all patches
-        for lib, offset, _ in parser.patches:
-            patches.append(f'PATCH_LIB("{lib}","0x{offset}","{patch_hex.replace(" ", "")}");')
-        
-        # Apply to extra offsets
-        for _, offset, _ in parser.extra_offsets:
-            patches.append(f'PATCH_LIB("libanogs.so","0x{offset}","{patch_hex.replace(" ", "")}");')
-        
-        response = f"✅ **Applied Patch: `{patch_hex}`**\n\n🔧 **Generated Code:**\n```\n" + '\n'.join(patches) + "\n```"
-        
-        keyboard = [[InlineKeyboardButton("🔙 New Input", callback_data="new_input")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        await query.edit_message_text(response, parse_mode='Markdown', reply_markup=reply_markup)
-
-async def back_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Back to main"""
-    await update.callback_query.edit_message_text("Input bhejo!")
+        await query.edit_message_text(
+            f"✅ Applied: `{patch_hex}`\n\n"
+            f"Paste apna input dobara for conversion!"
+        )
 
 def main():
-    """Start the bot"""
     application = Application.builder().token(BOT_TOKEN).build()
     
     application.add_handler(CommandHandler("start", start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    application.add_handler(CallbackQueryHandler(button_callback, pattern="^(patch_options|back)$"))
+    application.add_handler(CallbackQueryHandler(button_callback, pattern="^patch_options$"))
     application.add_handler(CallbackQueryHandler(patch_callback, pattern="^patch_"))
     
     print("🤖 Bot started...")
