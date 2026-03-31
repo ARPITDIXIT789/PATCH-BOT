@@ -9,23 +9,77 @@ HOOK_FILE = "hook.txt"
 class AdvancedParser:
     def __init__(self):
         self.hooks = self.load_hooks()
+        self.hook_details = self.load_hook_details()
     
     def load_hooks(self):
-        """Load hooks from hook.txt file"""
+        """Load hooks from hook.txt file - supports multiple formats"""
         hooks = {}
         if os.path.exists(HOOK_FILE):
-            with open(HOOK_FILE, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and 'HOOK OFFSET' in line:
-                        # Parse format: "ANOGS - 0x1C79D4 HOOK OFFSET"
-                        match = re.search(r'(\w+)\s*-\s*(0x[0-9A-Fa-f]+)\s+HOOK OFFSET', line, re.IGNORECASE)
-                        if match:
-                            lib = match.group(1)
-                            offset = match.group(2).upper()
-                            key = f"{lib}:{offset}"
-                            hooks[key] = True
+            with open(HOOK_FILE, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+                # Format 1: HOOK_LIB("libanogs.so","0x2328F0", ...
+                hook_lib_pattern = r'HOOK_LIB\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,'
+                for match in re.finditer(hook_lib_pattern, content):
+                    lib = match.group(1)
+                    offset = match.group(2).upper()
+                    key = f"{lib}:{offset}"
+                    hooks[key] = {'type': 'HOOK_LIB', 'offset': offset, 'lib': lib}
+                
+                # Format 2: HOOK_LIB_NO_ORIG("libanogs.so","0x37FD78", ...
+                hook_no_orig_pattern = r'HOOK_LIB_NO_ORIG\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,'
+                for match in re.finditer(hook_no_orig_pattern, content):
+                    lib = match.group(1)
+                    offset = match.group(2).upper()
+                    key = f"{lib}:{offset}"
+                    hooks[key] = {'type': 'HOOK_LIB_NO_ORIG', 'offset': offset, 'lib': lib}
+                
+                # Format 3: Simple format: libanogs.so 0x2328F0 HOOK
+                simple_pattern = r'(\w+\.so)\s+(0x[0-9A-Fa-f]+)\s+(?:HOOK|HOOK_LIB|HOOK_LIB_NO_ORIG)'
+                for match in re.finditer(simple_pattern, content, re.IGNORECASE):
+                    lib = match.group(1)
+                    offset = match.group(2).upper()
+                    key = f"{lib}:{offset}"
+                    if key not in hooks:
+                        hooks[key] = {'type': 'HOOK', 'offset': offset, 'lib': lib}
+                
+                # Format 4: ANOGS - 0x1C79D4 HOOK OFFSET
+                hook_offset_pattern = r'(\w+\.so)\s*-\s*(0x[0-9A-Fa-f]+)\s+HOOK OFFSET'
+                for match in re.finditer(hook_offset_pattern, content, re.IGNORECASE):
+                    lib = match.group(1)
+                    offset = match.group(2).upper()
+                    key = f"{lib}:{offset}"
+                    if key not in hooks:
+                        hooks[key] = {'type': 'HOOK', 'offset': offset, 'lib': lib}
+        
         return hooks
+    
+    def load_hook_details(self):
+        """Load detailed hook information from hook.txt"""
+        details = {}
+        if os.path.exists(HOOK_FILE):
+            with open(HOOK_FILE, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+                # Extract function names and details
+                hook_pattern = r'HOOK_LIB\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*(\w+)\s*,\s*(\w+)\s*\)'
+                for match in re.finditer(hook_pattern, content):
+                    lib = match.group(1)
+                    offset = match.group(2).upper()
+                    hook_func = match.group(3)
+                    orig_func = match.group(4)
+                    key = f"{lib}:{offset}"
+                    details[key] = f"HOOK_LIB with function {hook_func} (original: {orig_func})"
+                
+                hook_no_orig_pattern = r'HOOK_LIB_NO_ORIG\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*(\w+)\s*\)'
+                for match in re.finditer(hook_no_orig_pattern, content):
+                    lib = match.group(1)
+                    offset = match.group(2).upper()
+                    hook_func = match.group(3)
+                    key = f"{lib}:{offset}"
+                    details[key] = f"HOOK_LIB_NO_ORIG with function {hook_func}"
+        
+        return details
     
     def parse_patch_line(self, line):
         """Parse advanced patch format"""
@@ -74,6 +128,14 @@ class AdvancedParser:
         for line in lines:
             parsed = self.parse_patch_line(line)
             if parsed:
+                # Check if this offset is a hook
+                key = f"{parsed['lib']}:{parsed['offset']}"
+                if key in self.hooks:
+                    parsed['is_hook'] = True
+                    parsed['hook_type'] = self.hooks[key]['type']
+                    parsed['hook_details'] = self.hook_details.get(key, '')
+                else:
+                    parsed['is_hook'] = False
                 results.append(parsed)
                 continue
             
@@ -81,13 +143,16 @@ class AdvancedParser:
             simple_matches = re.findall(r'0x([0-9A-Fa-f]{6,8})', line, re.IGNORECASE)
             for match in simple_matches:
                 offset = f"0x{match.upper()}"
-                # Check if this offset is a hook
-                key = f"libanogs.so:{offset}"
-                is_hook = key in self.hooks
                 
                 # Try to detect lib from line
                 lib_match = re.search(r'(\w+\.so)', line, re.IGNORECASE)
                 lib = lib_match.group(1) if lib_match else "libanogs.so"
+                
+                # Check if this offset is a hook
+                key = f"{lib}:{offset}"
+                is_hook = key in self.hooks
+                hook_type = self.hooks[key]['type'] if is_hook else None
+                hook_details = self.hook_details.get(key, '') if is_hook else ''
                 
                 # Try to detect hex from line
                 hex_match = re.search(r'[h\s]+([0-9A-Fa-f]{2}\s+[0-9A-Fa-f]{2}\s+[0-9A-Fa-f]{2}\s+[0-9A-Fa-f]{2})', line, re.IGNORECASE)
@@ -97,18 +162,28 @@ class AdvancedParser:
                     'type': 'hook' if is_hook else ('patch' if hex_val else 'offset'),
                     'lib': lib,
                     'offset': offset,
-                    'hex': hex_val
+                    'hex': hex_val,
+                    'is_hook': is_hook,
+                    'hook_type': hook_type,
+                    'hook_details': hook_details
                 })
         
         return results
 
-def generate_patch_string(lib, offset, hex_val):
+def generate_patch_string(lib, offset, hex_val, is_hook=False, hook_type=None):
     """Generate patch string with proper formatting"""
+    if is_hook:
+        if hook_type == 'HOOK_LIB_NO_ORIG':
+            return f'// ⚠️ HOOK DETECTED: {hook_type}\n// {lib} {offset} requires hook function\nPATCH_LIB("{lib}","{offset}","{hex_val if hex_val else "00 00 80 D2 C0 03 5F D6"}"); // HOOK OFFSET - USE WITH CAUTION'
+        else:
+            return f'// ⚠️ HOOK DETECTED: {hook_type if hook_type else "HOOK"}\nPATCH_LIB("{lib}","{offset}","{hex_val if hex_val else "00 00 80 D2 C0 03 5F D6"}"); // HOOK OFFSET'
+    
     if hex_val:
         return f'PATCH_LIB("{lib}","{offset}","{hex_val}");'
     return f'PATCH_LIB("{lib}","{offset}","00 00 80 D2 C0 03 5F D6");'
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    parser = AdvancedParser()
     await update.message.reply_text(
         "🎯 ADVANCED PATCH BOT\n\n"
         "Send offsets in any format:\n"
@@ -116,7 +191,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• anogs.so - 0xABCDEF\n"
         "• Patch Found: libUE4.so -> 0x5952F70 [h 00 00 80 D2 C0 03 5F D6]\n"
         "• ANOGS - 0x1C79D4 HOOK OFFSET\n\n"
-        f"📁 Hook file loaded: {len(AdvancedParser().hooks)} hooks"
+        f"📁 Hook file loaded: {len(parser.hooks)} hooks\n"
+        f"🪝 Hook types: HOOK_LIB, HOOK_LIB_NO_ORIG, and standard hooks"
     )
 
 async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -131,34 +207,40 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Group by type for display
-    hooks = [item for item in parsed_items if item['type'] == 'hook']
-    patches = [item for item in parsed_items if item['type'] == 'patch']
-    offsets = [item for item in parsed_items if item['type'] == 'offset']
+    hooks = [item for item in parsed_items if item.get('is_hook', False)]
+    patches = [item for item in parsed_items if item['type'] == 'patch' and not item.get('is_hook')]
+    offsets = [item for item in parsed_items if item['type'] == 'offset' and not item.get('is_hook')]
     
     response = f"✅ Found {len(parsed_items)} items:\n"
     response += f"   🔧 Patches: {len(patches)}\n"
     response += f"   🪝 Hooks: {len(hooks)}\n"
     response += f"   📍 Offsets: {len(offsets)}\n\n"
     
-    # Show hooks found
+    # Show hooks found with details
     if hooks:
         response += "🪝 **HOOKS DETECTED:**\n"
         for hook in hooks:
-            response += f"   • {hook['lib']} {hook['offset']}\n"
-        response += "\n"
+            response += f"   • {hook['lib']} {hook['offset']}"
+            if hook.get('hook_type'):
+                response += f" [{hook['hook_type']}]"
+            if hook.get('hook_details'):
+                response += f"\n     └─ {hook['hook_details']}"
+            response += "\n"
+        response += "\n⚠️ **WARNING:** Patching hook offsets may cause crashes!\n\n"
     
     # Store parsed items for later use
     context.user_data['parsed_items'] = parsed_items
     
-    # Generate initial patches (using default hex or detected hex)
+    # Generate initial patches
     patches_list = []
     for item in parsed_items:
-        if item['type'] == 'hook':
-            # For hooks, we still generate patch but mark as hook
-            patches_list.append(generate_patch_string(item['lib'], item['offset'], None))
-        else:
-            hex_val = item.get('hex')
-            patches_list.append(generate_patch_string(item['lib'], item['offset'], hex_val))
+        patches_list.append(generate_patch_string(
+            item['lib'], 
+            item['offset'], 
+            item.get('hex'),
+            item.get('is_hook', False),
+            item.get('hook_type')
+        ))
     
     response += "```\n" + "\n".join(patches_list) + "\n```"
     
@@ -166,7 +248,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("RET", callback_data="ret"), 
          InlineKeyboardButton("RET0", callback_data="ret0")],
         [InlineKeyboardButton("NOP", callback_data="nop"),
-         InlineKeyboardButton("Show Hooks", callback_data="show_hooks")]
+         InlineKeyboardButton("📋 Show Hooks", callback_data="show_hooks")]
     ]
     
     await update.message.reply_text(
@@ -183,8 +265,14 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parser = AdvancedParser()
         if parser.hooks:
             response = "🪝 **HOOK LIST:**\n\n"
-            for hook_key in sorted(parser.hooks.keys()):
-                response += f"• {hook_key.replace(':', ' - ')}\n"
+            for key, hook in sorted(parser.hooks.items()):
+                lib, offset = key.split(':')
+                response += f"• {lib} {offset}"
+                if hook.get('type'):
+                    response += f" [{hook['type']}]"
+                if parser.hook_details.get(key):
+                    response += f"\n  └─ {parser.hook_details[key]}"
+                response += "\n\n"
                 if len(response) > 3500:  # Telegram message limit
                     response += "\n... and more"
                     break
@@ -209,18 +297,30 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Generate patches with new hex value
     patches = []
     hook_count = 0
+    hook_lib_no_orig_count = 0
     
     for item in parsed_items:
-        if item['type'] == 'hook':
+        if item.get('is_hook'):
             hook_count += 1
-            # For hooks, we still patch but show warning
-            patches.append(f"// HOOK OFFSET\n{generate_patch_string(item['lib'], item['offset'], hex_val)}")
+            if item.get('hook_type') == 'HOOK_LIB_NO_ORIG':
+                hook_lib_no_orig_count += 1
+            patches.append(generate_patch_string(
+                item['lib'], 
+                item['offset'], 
+                hex_val,
+                True,
+                item.get('hook_type')
+            ))
         else:
             patches.append(generate_patch_string(item['lib'], item['offset'], hex_val))
     
     response = f"🔧 Applied: {query.data.upper()}\n"
     if hook_count > 0:
-        response += f"⚠️ Warning: {hook_count} hook offset(s) detected!\n\n"
+        response += f"⚠️ **WARNING:** {hook_count} hook offset(s) detected!\n"
+        if hook_lib_no_orig_count > 0:
+            response += f"   🔴 {hook_lib_no_orig_count} HOOK_LIB_NO_ORIG offsets - These require hook functions!\n"
+        response += "   ⚡ Patching hooks may cause crashes or instability\n\n"
+    
     response += "```\n" + "\n".join(patches) + "\n```"
     
     await query.edit_message_text(response, parse_mode='Markdown')
@@ -228,9 +328,17 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     # Create hook.txt if it doesn't exist
     if not os.path.exists(HOOK_FILE):
-        with open(HOOK_FILE, 'w') as f:
-            f.write("# Add hooks in format: libname.so - 0xOFFSET HOOK OFFSET\n")
-            f.write("# Example: libanogs.so - 0x1C79D4 HOOK OFFSET\n")
+        with open(HOOK_FILE, 'w', encoding='utf-8') as f:
+            f.write("# Hook File Format Examples:\n")
+            f.write("# \n")
+            f.write("# Format 1: HOOK_LIB with original function\n")
+            f.write('HOOK_LIB("libanogs.so","0x2328F0", hsub_2328F0, osub_2328F0);\n\n')
+            f.write("# Format 2: HOOK_LIB_NO_ORIG (no original function)\n")
+            f.write('HOOK_LIB_NO_ORIG("libanogs.so","0x37FD78", hsub_37FD78);\n\n')
+            f.write("# Format 3: Simple format\n")
+            f.write("libanogs.so 0x275A0C HOOK\n\n")
+            f.write("# Format 4: With HOOK OFFSET\n")
+            f.write("ANOGS - 0x1C79D4 HOOK OFFSET\n")
     
     app = Application.builder().token(BOT_TOKEN).build()
     
@@ -238,9 +346,11 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_message))
     app.add_handler(CallbackQueryHandler(button_click))
     
+    parser = AdvancedParser()
     print("✅ ADVANCED BOT STARTED!")
     print(f"📁 Hook file: {HOOK_FILE}")
-    print(f"🪝 Hooks loaded: {len(AdvancedParser().hooks)}")
+    print(f"🪝 Hooks loaded: {len(parser.hooks)}")
+    print(f"📝 Hook types: HOOK_LIB, HOOK_LIB_NO_ORIG, and standard hooks")
     app.run_polling()
 
 if __name__ == '__main__':
