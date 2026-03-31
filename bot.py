@@ -10,6 +10,7 @@ class AdvancedParser:
     def __init__(self):
         self.hooks = self.load_hooks()
         self.hook_details = self.load_hook_details()
+        self.complete_hooks = self.load_complete_hooks()
     
     def load_hooks(self):
         """Load hooks from hook.txt file - supports multiple formats"""
@@ -53,6 +54,39 @@ class AdvancedParser:
                         hooks[key] = {'type': 'HOOK', 'offset': offset, 'lib': lib}
         
         return hooks
+    
+    def load_complete_hooks(self):
+        """Load complete hook code (including function definitions) from hook.txt"""
+        complete_hooks = {}
+        if os.path.exists(HOOK_FILE):
+            with open(HOOK_FILE, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+                # Split by HOOK_LIB or HOOK_LIB_NO_ORIG to get complete hook blocks
+                # Pattern to match complete hook blocks (function definition + HOOK_LIB)
+                hook_block_pattern = r'((?:__int64\s+.*?\{[^}]*\})\s*(?:HOOK_LIB(?:_NO_ORIG)?\s*\([^;]+\);))'
+                matches = re.finditer(hook_block_pattern, content, re.DOTALL)
+                
+                for match in matches:
+                    block = match.group(1)
+                    # Extract offset from the block
+                    offset_match = re.search(r'HOOK_LIB(?:_NO_ORIG)?\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"', block)
+                    if offset_match:
+                        lib = offset_match.group(1)
+                        offset = offset_match.group(2).upper()
+                        key = f"{lib}:{offset}"
+                        complete_hooks[key] = block.strip()
+                
+                # Also handle cases where only HOOK_LIB without function definition
+                hook_only_pattern = r'HOOK_LIB(?:_NO_ORIG)?\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*,\s*([^,]+)(?:,\s*([^)]+))?\s*\);'
+                for match in re.finditer(hook_only_pattern, content):
+                    lib = match.group(1)
+                    offset = match.group(2).upper()
+                    key = f"{lib}:{offset}"
+                    if key not in complete_hooks:
+                        complete_hooks[key] = match.group(0).strip()
+        
+        return complete_hooks
     
     def load_hook_details(self):
         """Load detailed hook information from hook.txt"""
@@ -134,6 +168,7 @@ class AdvancedParser:
                     parsed['is_hook'] = True
                     parsed['hook_type'] = self.hooks[key]['type']
                     parsed['hook_details'] = self.hook_details.get(key, '')
+                    parsed['complete_hook'] = self.complete_hooks.get(key, '')
                 else:
                     parsed['is_hook'] = False
                 results.append(parsed)
@@ -153,6 +188,7 @@ class AdvancedParser:
                 is_hook = key in self.hooks
                 hook_type = self.hooks[key]['type'] if is_hook else None
                 hook_details = self.hook_details.get(key, '') if is_hook else ''
+                complete_hook = self.complete_hooks.get(key, '') if is_hook else ''
                 
                 # Try to detect hex from line
                 hex_match = re.search(r'[h\s]+([0-9A-Fa-f]{2}\s+[0-9A-Fa-f]{2}\s+[0-9A-Fa-f]{2}\s+[0-9A-Fa-f]{2})', line, re.IGNORECASE)
@@ -165,7 +201,8 @@ class AdvancedParser:
                     'hex': hex_val,
                     'is_hook': is_hook,
                     'hook_type': hook_type,
-                    'hook_details': hook_details
+                    'hook_details': hook_details,
+                    'complete_hook': complete_hook
                 })
         
         return results
@@ -192,7 +229,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Patch Found: libUE4.so -> 0x5952F70 [h 00 00 80 D2 C0 03 5F D6]\n"
         "• ANOGS - 0x1C79D4 HOOK OFFSET\n\n"
         f"📁 Hook file loaded: {len(parser.hooks)} hooks\n"
-        f"🪝 Hook types: HOOK_LIB, HOOK_LIB_NO_ORIG, and standard hooks"
+        f"🪝 Complete hooks: {len(parser.complete_hooks)}\n"
+        f"⚡ If hook offset is detected, complete hook code will be shown!"
     )
 
 async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -216,17 +254,18 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     response += f"   🪝 Hooks: {len(hooks)}\n"
     response += f"   📍 Offsets: {len(offsets)}\n\n"
     
-    # Show hooks found with details
+    # Show complete hook code if found
     if hooks:
-        response += "🪝 **HOOKS DETECTED:**\n"
+        response += "🪝 **COMPLETE HOOK CODE FOUND:**\n\n"
         for hook in hooks:
-            response += f"   • {hook['lib']} {hook['offset']}"
-            if hook.get('hook_type'):
-                response += f" [{hook['hook_type']}]"
-            if hook.get('hook_details'):
-                response += f"\n     └─ {hook['hook_details']}"
-            response += "\n"
-        response += "\n⚠️ **WARNING:** Patching hook offsets may cause crashes!\n\n"
+            if hook.get('complete_hook'):
+                response += f"**Offset: {hook['offset']}**\n"
+                response += "```c\n"
+                response += hook['complete_hook']
+                response += "\n```\n\n"
+            else:
+                response += f"⚠️ Hook {hook['offset']} found but complete code not available\n"
+        response += "---\n\n"
     
     # Store parsed items for later use
     context.user_data['parsed_items'] = parsed_items
@@ -242,13 +281,14 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             item.get('hook_type')
         ))
     
+    response += "**PATCH CODE:**\n"
     response += "```\n" + "\n".join(patches_list) + "\n```"
     
     keyboard = [
         [InlineKeyboardButton("RET", callback_data="ret"), 
          InlineKeyboardButton("RET0", callback_data="ret0")],
         [InlineKeyboardButton("NOP", callback_data="nop"),
-         InlineKeyboardButton("📋 Show Hooks", callback_data="show_hooks")]
+         InlineKeyboardButton("📋 All Hooks", callback_data="show_hooks")]
     ]
     
     await update.message.reply_text(
@@ -263,17 +303,28 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if query.data == "show_hooks":
         parser = AdvancedParser()
-        if parser.hooks:
-            response = "🪝 **HOOK LIST:**\n\n"
+        if parser.complete_hooks:
+            response = "🪝 **ALL COMPLETE HOOKS:**\n\n"
+            for key, hook_code in sorted(parser.complete_hooks.items()):
+                lib, offset = key.split(':')
+                response += f"**{lib} {offset}**\n"
+                response += "```c\n"
+                # Truncate if too long
+                if len(hook_code) > 800:
+                    response += hook_code[:800] + "\n... (truncated)"
+                else:
+                    response += hook_code
+                response += "\n```\n\n"
+                if len(response) > 3500:  # Telegram message limit
+                    response += "\n... and more hooks available"
+                    break
+            await query.edit_message_text(response, parse_mode='Markdown')
+        elif parser.hooks:
+            response = "🪝 **HOOK OFFSETS:**\n\n"
             for key, hook in sorted(parser.hooks.items()):
                 lib, offset = key.split(':')
-                response += f"• {lib} {offset}"
-                if hook.get('type'):
-                    response += f" [{hook['type']}]"
-                if parser.hook_details.get(key):
-                    response += f"\n  └─ {parser.hook_details[key]}"
-                response += "\n\n"
-                if len(response) > 3500:  # Telegram message limit
+                response += f"• {lib} {offset} [{hook['type']}]\n"
+                if len(response) > 3500:
                     response += "\n... and more"
                     break
             await query.edit_message_text(response, parse_mode='Markdown')
@@ -329,16 +380,34 @@ def main():
     # Create hook.txt if it doesn't exist
     if not os.path.exists(HOOK_FILE):
         with open(HOOK_FILE, 'w', encoding='utf-8') as f:
-            f.write("# Hook File Format Examples:\n")
-            f.write("# \n")
-            f.write("# Format 1: HOOK_LIB with original function\n")
-            f.write('HOOK_LIB("libanogs.so","0x2328F0", hsub_2328F0, osub_2328F0);\n\n')
-            f.write("# Format 2: HOOK_LIB_NO_ORIG (no original function)\n")
-            f.write('HOOK_LIB_NO_ORIG("libanogs.so","0x37FD78", hsub_37FD78);\n\n')
-            f.write("# Format 3: Simple format\n")
-            f.write("libanogs.so 0x275A0C HOOK\n\n")
-            f.write("# Format 4: With HOOK OFFSET\n")
-            f.write("ANOGS - 0x1C79D4 HOOK OFFSET\n")
+            f.write("""// Example Hook File
+// Complete hook with function definition and HOOK_LIB
+
+__int64 (*osub_2328F0)(__int64 a1, const char *a2, __int64 a3);
+__int64 hsub_2328F0(__int64 a1, const char *a2, __int64 a3) {
+    auto case16 = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+    std::string str_a2(a2);
+    if (strstr(a2, oxorany("XTask_builtin.zip_vm_main.img"))) {
+        sleep(100000);
+    }
+    if (strstr(a2, oxorany("crash")) || strstr(a2, oxorany("opcode"))){
+        return 0LL;
+    } else {
+        auto case16 = osub_2328F0(a1, a2, a3);
+        return case16;
+    }
+}
+HOOK_LIB("libanogs.so","0x2328F0", hsub_2328F0, osub_2328F0);
+
+// HOOK_LIB_NO_ORIG example
+__int64 __fastcall hsub_37FD78(_QWORD *a1, __int64 a2, unsigned __int64 a3, unsigned int a4) {
+    return 1LL;  // Always safe!
+}
+HOOK_LIB_NO_ORIG("libanogs.so", "0x37FD78", hsub_37FD78);
+
+// Simple hook offset
+libanogs.so 0x275A0C HOOK
+""")
     
     app = Application.builder().token(BOT_TOKEN).build()
     
@@ -350,7 +419,8 @@ def main():
     print("✅ ADVANCED BOT STARTED!")
     print(f"📁 Hook file: {HOOK_FILE}")
     print(f"🪝 Hooks loaded: {len(parser.hooks)}")
-    print(f"📝 Hook types: HOOK_LIB, HOOK_LIB_NO_ORIG, and standard hooks")
+    print(f"📝 Complete hooks with code: {len(parser.complete_hooks)}")
+    print("⚡ Now bot will show complete hook code when hook offset is detected!")
     app.run_polling()
 
 if __name__ == '__main__':
