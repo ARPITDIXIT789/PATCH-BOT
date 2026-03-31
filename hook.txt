@@ -1,0 +1,110 @@
+__int64 (*osub_2328F0)(__int64 a1, const char *a2, __int64 a3);
+__int64 hsub_2328F0(__int64 a1, const char *a2, __int64 a3) {
+auto case16 = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+std::string str_a2(a2);
+if (strstr(a2, oxorany("XTask_builtin.zip_vm_main.img"))) {
+sleep(100000);}
+if (strstr(a2, oxorany("crash")) || strstr(a2, oxorany("opcode"))){
+return 0LL;
+}else{
+auto case16 = osub_2328F0(a1, a2, a3);
+return case16;
+}}
+HOOK_LIB("libanogs.so","0x2328F0", hsub_2328F0, osub_2328F0);
+
+
+
+
+__int64 __fastcall hsub_37FD78(_QWORD *a1, __int64 a2, unsigned __int64 a3, unsigned int a4) {
+
+    
+    return 1LL;  // Always safe!
+}
+
+HOOK_LIB_NO_ORIG("libanogs.so", "0x37FD78", hsub_37FD78);
+
+__int64 __fastcall Integrity_Check(__int64 a1, __int64 a2, int a3, __int64 a4)
+{
+  if ( a3 )
+  {
+      return 0;
+  }
+  return 0xFFFFFFFFLL;
+}
+
+HOOK_LIB_NO_ORIG("libanogs.so", "0x4D886C", Integrity_Check);
+
+__int64 __fastcall (*sub_228168)(__int64 a1, unsigned __int8 *a2, size_t a3);
+__int64 __fastcall hsub_228168(__int64 a1, unsigned __int8 *a2, size_t a3)
+{
+if (a3 == 0x1e){return 0LL;}
+if (a3 == 0x2e){return 0LL;}
+if (a3 == 0x16){return 0LL;}
+if (a3 == 0x62){return 0LL;}
+if (a3 == 0x3c){return 0LL;}
+if (a3 == 0x46){return 0LL;}
+return sub_228168(a1,a2,a3);
+}
+
+HOOK_LIB("libanogs.so","0x228168", hsub_228168, sub_228168);
+
+__int64 __fastcall Integrity_Check(__int64 a1, __int64 a2, int a3, __int64 a4)
+{
+  if ( a3 )
+  {
+      return 0;
+  }
+  return 0xFFFFFFFFLL;
+}
+
+__int64 __fastcall sub_49A624(unsigned __int8 a1, unsigned __int8 a2, int a3, void *src, size_t n, void *dest, __int64 *a7)
+{
+    if (!src || !dest || !a7) 
+         return 0xFFFFFFFFLL;
+
+    if (*a7 < n) 
+         return 0xFFFFFFFELL;
+    
+    memcpy(dest, src, n);
+    *a7 = n;
+    
+    return 0;  
+} 
+
+HOOK_LIB_NO_ORIG("libanogs.so", "0x4D886C", Integrity_Check);
+HOOK_LIB_NO_ORIG("libanogs.so", "0x49A624", sub_49A624);
+
+
+__int64 __fastcall sub_4D886C(__int64 a1, __int64 a2, int a3, __int64 a4)
+{
+
+  if ( a3 )
+  {
+     return 0; 
+  }
+  return 0xFFFFFFFFLL;
+}
+
+
+__int64 __fastcall (*osub_4D47D8)(__int64 a1, __int64 a2, int a3, char a4);
+__int64 __fastcall hsub_4D47D8(__int64 a1, __int64 a2, int a3, char a4)
+{
+    if ( a3 == 110100 || a3 == 110101 || a3 == 110102 || a3 == 40004 )
+       return 0;
+    }
+    return osub_4D47D8(a1,a2,a3,a4);
+}
+
+__int64 (*osub_49AA00)(char *a1, __int64 a2) = nullptr;
+__int64 __fastcall hsub_49AA00(char *a1, __int64 a2)
+{
+    if (a2 == 128) {
+        return 0xC9C1E178;
+    }
+    
+    if (a2 == 4096) {
+        return 0x12345678;  
+    }
+    
+    return 0;
+}
