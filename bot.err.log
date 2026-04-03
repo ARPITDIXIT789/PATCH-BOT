@@ -1,0 +1,7 @@
+2026-04-03 15:07:50,513 | INFO | patch-bot | Reloaded 16 hook entries from hook.txt
+2026-04-03 15:07:57,145 | INFO | patch-bot | Advanced Patch Bot started
+2026-04-03 15:07:57,149 | INFO | patch-bot | Hook file: hook.txt
+2026-04-03 15:07:57,149 | INFO | patch-bot | Hooks loaded: 16
+2026-04-03 15:07:57,150 | INFO | patch-bot | Complete hook blocks: 16
+2026-04-03 15:07:58,876 | INFO | apscheduler.scheduler | Scheduler started
+2026-04-03 15:07:58,880 | INFO | telegram.ext.Application | Application started
