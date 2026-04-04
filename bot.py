@@ -1,8 +1,10 @@
 import html
+import json
 import logging
 import os
 import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -22,6 +24,8 @@ load_dotenv(dotenv_path=Path(__file__).with_name(".env"))
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 HOOK_FILE = Path(os.getenv("HOOK_FILE", "hook.txt"))
+OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "5367104890"))
+USAGE_FILE = Path(os.getenv("USAGE_FILE", "usage_stats.json"))
 DEFAULT_PATCH_HEX = "00 00 80 D2 C0 03 5F D6"
 MAX_MESSAGE_LENGTH = 3800
 MAX_UPLOAD_SIZE = 1024 * 1024
@@ -82,6 +86,108 @@ class ParsedItem:
             hook_details=str(data.get("hook_details", "")),
             complete_hook=str(data.get("complete_hook", "")),
         )
+
+
+class UsageTracker:
+    def __init__(self, stats_file: Path) -> None:
+        self.stats_file = stats_file
+        self.data = self._load()
+
+    def _default(self) -> Dict[str, object]:
+        return {
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "total_events": 0,
+            "total_text_messages": 0,
+            "total_documents": 0,
+            "total_custom_hex": 0,
+            "total_hooks_added": 0,
+            "users": {},
+        }
+
+    def _load(self) -> Dict[str, object]:
+        if not self.stats_file.exists():
+            return self._default()
+        try:
+            return json.loads(self.stats_file.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            LOGGER.warning("Failed to read %s. Rebuilding usage stats.", self.stats_file)
+            return self._default()
+
+    def save(self) -> None:
+        self.stats_file.write_text(
+            json.dumps(self.data, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+
+    def record_event(
+        self,
+        update: Update,
+        event_type: str,
+        extra: Optional[Dict[str, object]] = None,
+    ) -> None:
+        extra = extra or {}
+        self.data["total_events"] = int(self.data.get("total_events", 0)) + 1
+        users = self.data.setdefault("users", {})
+
+        user = update.effective_user
+        chat = update.effective_chat
+        if user:
+            user_key = str(user.id)
+            record = users.setdefault(
+                user_key,
+                {
+                    "first_seen": datetime.now(timezone.utc).isoformat(),
+                    "last_seen": "",
+                    "username": user.username or "",
+                    "full_name": user.full_name or "",
+                    "chat_id": chat.id if chat else None,
+                    "events": 0,
+                    "text_messages": 0,
+                    "documents": 0,
+                },
+            )
+            record["last_seen"] = datetime.now(timezone.utc).isoformat()
+            record["username"] = user.username or record.get("username", "")
+            record["full_name"] = user.full_name or record.get("full_name", "")
+            record["chat_id"] = chat.id if chat else record.get("chat_id")
+            record["events"] = int(record.get("events", 0)) + 1
+            if event_type == "text":
+                record["text_messages"] = int(record.get("text_messages", 0)) + 1
+            if event_type == "document":
+                record["documents"] = int(record.get("documents", 0)) + 1
+
+        counter_map = {
+            "text": "total_text_messages",
+            "document": "total_documents",
+            "custom_hex": "total_custom_hex",
+            "hook_added": "total_hooks_added",
+        }
+        counter_name = counter_map.get(event_type)
+        if counter_name:
+            increment = int(extra.get("count", 1))
+            self.data[counter_name] = int(self.data.get(counter_name, 0)) + increment
+
+        self.save()
+
+    def summary(self) -> Dict[str, object]:
+        users = self.data.get("users", {})
+        return {
+            "started_at": self.data.get("started_at", ""),
+            "unique_users": len(users),
+            "total_events": int(self.data.get("total_events", 0)),
+            "total_text_messages": int(self.data.get("total_text_messages", 0)),
+            "total_documents": int(self.data.get("total_documents", 0)),
+            "total_custom_hex": int(self.data.get("total_custom_hex", 0)),
+            "total_hooks_added": int(self.data.get("total_hooks_added", 0)),
+        }
+
+    def recent_users(self, limit: int = 10) -> List[Tuple[str, Dict[str, object]]]:
+        users = self.data.get("users", {})
+        return sorted(
+            users.items(),
+            key=lambda item: str(item[1].get("last_seen", "")),
+            reverse=True,
+        )[:limit]
 
 
 class AdvancedParser:
@@ -430,10 +536,29 @@ class AdvancedParser:
 
 
 PARSER = AdvancedParser(HOOK_FILE)
+USAGE = UsageTracker(USAGE_FILE)
+APP_STARTED_AT = datetime.now(timezone.utc)
 
 
 def escape_html(text: str) -> str:
     return html.escape(text, quote=False)
+
+
+def is_owner(update: Update) -> bool:
+    user = update.effective_user
+    chat = update.effective_chat
+    return bool(
+        (user and user.id == OWNER_CHAT_ID)
+        or (chat and chat.id == OWNER_CHAT_ID)
+    )
+
+
+async def require_owner(update: Update) -> bool:
+    if is_owner(update):
+        return True
+    if update.effective_message:
+        await update.effective_message.reply_text("Owner-only command.")
+    return False
 
 
 def render_code_block(code: str) -> str:
@@ -548,6 +673,41 @@ async def parse_and_present_input(
     await present_parsed_items(target_message, context, parsed_items, source_label)
 
 
+async def append_hook_content(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    hook_content: str,
+    source_label: str,
+) -> None:
+    normalized = hook_content.strip()
+    if not normalized:
+        await update.effective_message.reply_text("Empty hook content. Nothing was added.")
+        return
+
+    if "HOOK_LIB" not in normalized and "HOOK_LIB_NO_ORIG" not in normalized:
+        await update.effective_message.reply_text(
+            "Hook content must include <code>HOOK_LIB(...)</code> or <code>HOOK_LIB_NO_ORIG(...)</code>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    existing = HOOK_FILE.read_text(encoding="utf-8", errors="ignore") if HOOK_FILE.exists() else ""
+    separator = "\n\n" if existing.strip() else ""
+    HOOK_FILE.write_text(existing + separator + normalized + "\n", encoding="utf-8")
+    PARSER.ensure_loaded(force=True)
+    context.user_data["awaiting_hook_append"] = False
+    USAGE.record_event(update, "hook_added")
+
+    await update.effective_message.reply_text(
+        (
+            "<b>Hook Added</b>\n\n"
+            f"Source: {escape_html(source_label)}\n"
+            f"Hooks loaded now: <b>{PARSER.stats()['hooks']}</b>"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     stats = PARSER.stats()
     message = (
@@ -560,7 +720,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Loaded hooks: <b>{stats['hooks']}</b>\n"
         f"Complete hook blocks: <b>{stats['complete_hooks']}</b>\n"
         f"HOOK_LIB_NO_ORIG entries: <b>{stats['no_orig_hooks']}</b>\n\n"
-        "Commands: /help, /stats, /health, /reload"
+        "Commands: /help, /stats, /health, /reload\n"
+        "Owner commands: /addhook, /users, /botinfo"
     )
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
     context.user_data.pop("parsed_items", None)
@@ -581,6 +742,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- Use the Custom Hex button after parsing offsets to apply your own opcode bytes\n"
         "- Keep <code>hook.txt</code> updated, then use /reload\n"
         "- Run <code>/health</code> to check hook.txt for duplicates or missing macros\n"
+        "- Owner can use <code>/addhook</code> to add new hook blocks from chat or file upload\n"
+        "- Owner can use <code>/users</code> and <code>/botinfo</code> for usage analytics\n"
         "- Set the Telegram token with the <code>BOT_TOKEN</code> environment variable"
     )
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
@@ -625,6 +788,73 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         sections.append("<b>Summary</b>\n" + "\n".join(f"- {escape_html(item)}" for item in info))
 
     await update.message.reply_text("\n\n".join(sections), parse_mode=ParseMode.HTML)
+
+
+async def addhook_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_owner(update):
+        return
+
+    message_text = update.message.text if update.message else ""
+    payload = message_text.partition(" ")[2].strip()
+    if payload:
+        await append_hook_content(update, context, payload, "inline command")
+        return
+
+    context.user_data["awaiting_hook_append"] = True
+    await update.message.reply_text(
+        "Send the hook block now as text, or upload a text file with caption <code>/addhook</code>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_owner(update):
+        return
+
+    recent = USAGE.recent_users(limit=15)
+    lines = ["<b>Recent Users</b>"]
+    if not recent:
+        lines.append("No users recorded yet.")
+    else:
+        for user_id, record in recent:
+            username = record.get("username") or "-"
+            full_name = record.get("full_name") or "-"
+            last_seen = record.get("last_seen") or "-"
+            events = record.get("events", 0)
+            lines.append(
+                f"- <code>{escape_html(user_id)}</code> | "
+                f"{escape_html(str(full_name))} | "
+                f"@{escape_html(str(username))} | "
+                f"events: <b>{events}</b> | "
+                f"last: <code>{escape_html(str(last_seen))}</code>"
+            )
+
+    await send_long_message(update.message, "\n".join(lines))
+
+
+async def botinfo_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await require_owner(update):
+        return
+
+    usage = USAGE.summary()
+    parser_stats = PARSER.stats()
+    uptime_seconds = int((datetime.now(timezone.utc) - APP_STARTED_AT).total_seconds())
+    message = (
+        "<b>Bot Info</b>\n\n"
+        f"Owner chat id: <code>{OWNER_CHAT_ID}</code>\n"
+        f"Uptime: <b>{uptime_seconds}</b> seconds\n"
+        f"Started at: <code>{escape_html(str(usage['started_at']))}</code>\n"
+        f"Unique users: <b>{usage['unique_users']}</b>\n"
+        f"Total events: <b>{usage['total_events']}</b>\n"
+        f"Text messages: <b>{usage['total_text_messages']}</b>\n"
+        f"Documents: <b>{usage['total_documents']}</b>\n"
+        f"Custom hex uses: <b>{usage['total_custom_hex']}</b>\n"
+        f"Hooks added: <b>{usage['total_hooks_added']}</b>\n"
+        f"Hooks loaded: <b>{parser_stats['hooks']}</b>\n"
+        f"Complete hook blocks: <b>{parser_stats['complete_hooks']}</b>\n"
+        f"HOOK_LIB_NO_ORIG entries: <b>{parser_stats['no_orig_hooks']}</b>"
+    )
+    await update.message.reply_text(message, parse_mode=ParseMode.HTML)
 
 
 def build_keyboard() -> InlineKeyboardMarkup:
@@ -695,6 +925,12 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not update.message or not update.message.text:
         return
 
+    USAGE.record_event(update, "text")
+
+    if context.user_data.get("awaiting_hook_append", False) and is_owner(update):
+        await append_hook_content(update, context, update.message.text, "owner text message")
+        return
+
     pending_custom_hex = context.user_data.get("awaiting_custom_hex", False)
     if pending_custom_hex:
         parsed_items = get_saved_items(context)
@@ -715,6 +951,7 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         context.user_data.pop("awaiting_custom_hex", None)
+        USAGE.record_event(update, "custom_hex")
         sections = [
             f"<b>Applied Custom Hex</b>\n<code>{escape_html(custom_hex)}</code>",
             build_patch_output(parsed_items, override_hex=custom_hex),
@@ -738,6 +975,8 @@ async def process_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not update.message or not update.message.document:
         return
 
+    USAGE.record_event(update, "document")
+
     document: Document = update.message.document
     if document.file_size and document.file_size > MAX_UPLOAD_SIZE:
         await update.message.reply_text(
@@ -758,6 +997,16 @@ async def process_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     telegram_file = await document.get_file()
     file_bytes = await telegram_file.download_as_bytearray()
     file_text = bytes(file_bytes).decode("utf-8", errors="ignore")
+
+    if is_owner(update) and update.message.caption and update.message.caption.strip().startswith("/addhook"):
+        await append_hook_content(
+            update,
+            context,
+            file_text,
+            f"owner file upload: {document.file_name or 'attachment'}",
+        )
+        return
+
     combined_text = file_text
     if update.message.caption:
         combined_text = f"{update.message.caption}\n{file_text}"
@@ -893,6 +1142,9 @@ def main() -> None:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("health", health_command))
+    app.add_handler(CommandHandler("addhook", addhook_command))
+    app.add_handler(CommandHandler("users", users_command))
+    app.add_handler(CommandHandler("botinfo", botinfo_command))
     app.add_handler(CommandHandler("reload", reload_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_message))
     app.add_handler(MessageHandler(filters.Document.ALL, process_document))
