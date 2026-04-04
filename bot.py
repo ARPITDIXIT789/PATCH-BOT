@@ -4,10 +4,10 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from dotenv import load_dotenv
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Document, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
@@ -24,6 +24,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 HOOK_FILE = Path(os.getenv("HOOK_FILE", "hook.txt"))
 DEFAULT_PATCH_HEX = "00 00 80 D2 C0 03 5F D6"
 MAX_MESSAGE_LENGTH = 3800
+MAX_UPLOAD_SIZE = 1024 * 1024
+CUSTOM_HEX_CALLBACK = "custom_hex"
 
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -313,6 +315,97 @@ class AdvancedParser:
             "no_orig_hooks": no_orig_count,
         }
 
+    def analyze_health(self) -> Tuple[List[str], List[str]]:
+        self.ensure_loaded(force=True)
+        warnings: List[str] = []
+        info: List[str] = []
+
+        if not self.hook_file.exists():
+            return ["hook.txt is missing."], info
+
+        content = self.hook_file.read_text(encoding="utf-8", errors="ignore")
+        lines = content.splitlines()
+
+        brace_balance = 0
+        for line_number, line in enumerate(lines, 1):
+            brace_balance += line.count("{")
+            brace_balance -= line.count("}")
+            if brace_balance < 0:
+                warnings.append(f"Line {line_number}: closing brace appears before an opening brace.")
+                brace_balance = 0
+
+        if brace_balance != 0:
+            warnings.append("Brace count is unbalanced in hook.txt.")
+
+        macro_offsets: Dict[str, int] = {}
+        macro_pattern = re.compile(
+            r'HOOK_LIB(?:_NO_ORIG)?\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"',
+            re.IGNORECASE,
+        )
+        for line_number, line in enumerate(lines, 1):
+            match = macro_pattern.search(line)
+            if not match:
+                continue
+            key = self._make_key(match.group(1), match.group(2))
+            if key in macro_offsets:
+                warnings.append(
+                    f"Line {line_number}: duplicate hook macro for {key} "
+                    f"(first seen on line {macro_offsets[key]})."
+                )
+            else:
+                macro_offsets[key] = line_number
+
+        missing_hook_macros = self._find_missing_hook_macros(lines, macro_offsets)
+        warnings.extend(missing_hook_macros)
+
+        info.append(f"Parsed hooks: {len(self.hooks)}")
+        info.append(f"Macro offsets: {len(macro_offsets)}")
+        info.append(f"Complete hook blocks: {sum(1 for hook in self.hooks.values() if hook.complete_hook)}")
+        return warnings, info
+
+    def _find_missing_hook_macros(
+        self, lines: List[str], macro_offsets: Dict[str, int]
+    ) -> List[str]:
+        warnings: List[str] = []
+        pending: Optional[Tuple[str, str]] = None
+        func_pattern = re.compile(
+            r'(?:hsub|sub|hook_sub)_(?P<offset>[0-9A-Fa-f]{6,8})',
+            re.IGNORECASE,
+        )
+
+        for line_number, line in enumerate(lines, 1):
+            func_match = func_pattern.search(line)
+            if func_match:
+                pending = ("libanogs.so", f"0x{func_match.group('offset').upper()}")
+
+            macro_match = re.search(
+                r'HOOK_LIB(?:_NO_ORIG)?\s*\(\s*"([^"]+)"\s*,\s*"([^"]+)"',
+                line,
+                re.IGNORECASE,
+            )
+            if macro_match and pending:
+                macro_key = self._make_key(macro_match.group(1), macro_match.group(2))
+                pending_key = self._make_key(*pending)
+                if macro_key == pending_key:
+                    pending = None
+
+            if line.strip() == "" and pending:
+                pending_key = self._make_key(*pending)
+                if pending_key not in macro_offsets:
+                    warnings.append(
+                        f"Near line {line_number}: found hook function for {pending_key} without a matching hook macro."
+                    )
+                pending = None
+
+        if pending:
+            pending_key = self._make_key(*pending)
+            if pending_key not in macro_offsets:
+                warnings.append(
+                    f"End of file: found hook function for {pending_key} without a matching hook macro."
+                )
+
+        return warnings
+
     def _attach_hook_info(self, item: ParsedItem) -> ParsedItem:
         hook = self.hooks.get(self._make_key(item.lib, item.offset))
         if not hook:
@@ -345,6 +438,14 @@ def escape_html(text: str) -> str:
 
 def render_code_block(code: str) -> str:
     return f"<pre>{escape_html(code)}</pre>"
+
+
+def normalize_custom_hex(text: str) -> Optional[str]:
+    parts = re.findall(r"[0-9A-Fa-f]{2}", text)
+    joined = re.sub(r"\s+", "", text)
+    if not parts or len("".join(parts)) != len(joined):
+        return None
+    return " ".join(part.upper() for part in parts)
 
 
 def generate_patch_string(item: ParsedItem, override_hex: Optional[str] = None) -> str:
@@ -406,6 +507,47 @@ async def send_long_message(
         )
 
 
+def store_parsed_items(context: ContextTypes.DEFAULT_TYPE, parsed_items: List[ParsedItem]) -> None:
+    context.user_data["parsed_items"] = [item.to_dict() for item in parsed_items]
+
+
+async def present_parsed_items(
+    target_message,
+    context: ContextTypes.DEFAULT_TYPE,
+    parsed_items: List[ParsedItem],
+    source_label: str,
+) -> None:
+    store_parsed_items(context, parsed_items)
+    hooks = [item for item in parsed_items if item.is_hook]
+    sections = [f"<b>Source</b>: {escape_html(source_label)}", summarize_items(parsed_items)]
+    if hooks:
+        sections.append("<b>Complete Hook Preview</b>\n\n" + build_hook_preview(hooks[:3]))
+    sections.append("<b>Patch Code</b>\n\n" + build_patch_output(parsed_items))
+
+    await send_long_message(
+        target_message,
+        "\n\n".join(section for section in sections if section.strip()),
+        reply_markup=build_keyboard(),
+    )
+
+
+async def parse_and_present_input(
+    target_message,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    source_label: str,
+) -> None:
+    parsed_items = PARSER.extract_offsets_with_info(text)
+    if not parsed_items:
+        await target_message.reply_text(
+            "No valid offsets found. Send values like <code>0x123456</code>, patch lines, or upload a text file.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await present_parsed_items(target_message, context, parsed_items, source_label)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     stats = PARSER.stats()
     message = (
@@ -418,10 +560,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Loaded hooks: <b>{stats['hooks']}</b>\n"
         f"Complete hook blocks: <b>{stats['complete_hooks']}</b>\n"
         f"HOOK_LIB_NO_ORIG entries: <b>{stats['no_orig_hooks']}</b>\n\n"
-        "Commands: /help, /stats, /reload"
+        "Commands: /help, /stats, /health, /reload"
     )
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
     context.user_data.pop("parsed_items", None)
+    context.user_data.pop("awaiting_custom_hex", None)
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -434,7 +577,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "- let you quickly convert all results to RET, RET0, or NOP\n\n"
         "Tips:\n"
         "- Add a library name like <code>libUE4.so</code> for better matching\n"
+        "- Upload a <code>.txt</code>, <code>.log</code>, or source file to parse offsets from file content\n"
+        "- Use the Custom Hex button after parsing offsets to apply your own opcode bytes\n"
         "- Keep <code>hook.txt</code> updated, then use /reload\n"
+        "- Run <code>/health</code> to check hook.txt for duplicates or missing macros\n"
         "- Set the Telegram token with the <code>BOT_TOKEN</code> environment variable"
     )
     await update.message.reply_text(message, parse_mode=ParseMode.HTML)
@@ -465,6 +611,22 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
 
+async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    warnings, info = PARSER.analyze_health()
+    sections = ["<b>Hook File Health</b>"]
+    if warnings:
+        sections.append("<b>Warnings</b>\n" + "\n".join(f"- {escape_html(item)}" for item in warnings[:20]))
+        if len(warnings) > 20:
+            sections.append(f"Showing 20 of {len(warnings)} warnings.")
+    else:
+        sections.append("No structural issues were found in <code>hook.txt</code>.")
+
+    if info:
+        sections.append("<b>Summary</b>\n" + "\n".join(f"- {escape_html(item)}" for item in info))
+
+    await update.message.reply_text("\n\n".join(sections), parse_mode=ParseMode.HTML)
+
+
 def build_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -474,6 +636,9 @@ def build_keyboard() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("NOP", callback_data="nop"),
+                InlineKeyboardButton("Custom Hex", callback_data=CUSTOM_HEX_CALLBACK),
+            ],
+            [
                 InlineKeyboardButton("Matched Hooks", callback_data="show_hooks"),
             ],
         ]
@@ -530,26 +695,78 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     if not update.message or not update.message.text:
         return
 
-    parsed_items = PARSER.extract_offsets_with_info(update.message.text)
-    if not parsed_items:
+    pending_custom_hex = context.user_data.get("awaiting_custom_hex", False)
+    if pending_custom_hex:
+        parsed_items = get_saved_items(context)
+        if not parsed_items:
+            context.user_data.pop("awaiting_custom_hex", None)
+            await update.message.reply_text(
+                "No saved offsets found. Send offsets first, then try Custom Hex again.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        custom_hex = normalize_custom_hex(update.message.text)
+        if not custom_hex:
+            await update.message.reply_text(
+                "Invalid hex format. Send bytes like <code>C0 03 5F D6</code> or <code>000080D2C0035FD6</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        context.user_data.pop("awaiting_custom_hex", None)
+        sections = [
+            f"<b>Applied Custom Hex</b>\n<code>{escape_html(custom_hex)}</code>",
+            build_patch_output(parsed_items, override_hex=custom_hex),
+        ]
         await update.message.reply_text(
-            "No valid offsets found. Send values like <code>0x123456</code> or patch lines with a library name.",
+            "\n\n".join(sections),
+            parse_mode=ParseMode.HTML,
+            reply_markup=build_keyboard(),
+        )
+        return
+
+    await parse_and_present_input(
+        update.message,
+        context,
+        update.message.text,
+        "text message",
+    )
+
+
+async def process_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.document:
+        return
+
+    document: Document = update.message.document
+    if document.file_size and document.file_size > MAX_UPLOAD_SIZE:
+        await update.message.reply_text(
+            f"File is too large. Keep uploads under {MAX_UPLOAD_SIZE // 1024} KB.",
             parse_mode=ParseMode.HTML,
         )
         return
 
-    context.user_data["parsed_items"] = [item.to_dict() for item in parsed_items]
+    allowed_suffixes = {".txt", ".log", ".cpp", ".h", ".hpp", ".c"}
+    suffix = Path(document.file_name or "").suffix.lower()
+    if suffix and suffix not in allowed_suffixes:
+        await update.message.reply_text(
+            "Unsupported file type. Upload a text-based file like .txt, .log, .c, .cpp, or .h.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
 
-    hooks = [item for item in parsed_items if item.is_hook]
-    sections = [summarize_items(parsed_items)]
-    if hooks:
-        sections.append("<b>Complete Hook Preview</b>\n\n" + build_hook_preview(hooks[:3]))
-    sections.append("<b>Patch Code</b>\n\n" + build_patch_output(parsed_items))
+    telegram_file = await document.get_file()
+    file_bytes = await telegram_file.download_as_bytearray()
+    file_text = bytes(file_bytes).decode("utf-8", errors="ignore")
+    combined_text = file_text
+    if update.message.caption:
+        combined_text = f"{update.message.caption}\n{file_text}"
 
-    await send_long_message(
+    await parse_and_present_input(
         update.message,
-        "\n\n".join(section for section in sections if section.strip()),
-        reply_markup=build_keyboard(),
+        context,
+        combined_text,
+        f"file upload: {document.file_name or 'attachment'}",
     )
 
 
@@ -600,6 +817,22 @@ async def button_click(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if query.data == "show_hooks":
         await show_hooks(query, parsed_items)
+        return
+
+    if query.data == CUSTOM_HEX_CALLBACK:
+        if not parsed_items:
+            await query.edit_message_text(
+                "No saved offsets found. Send the offsets again to rebuild the patch list.",
+                parse_mode=ParseMode.HTML,
+                reply_markup=build_keyboard(),
+            )
+            return
+
+        context.user_data["awaiting_custom_hex"] = True
+        await query.message.reply_text(
+            "Send custom hex bytes now, for example <code>C0 03 5F D6</code> or <code>000080D2C0035FD6</code>.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
     if not parsed_items:
@@ -659,8 +892,10 @@ def main() -> None:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("health", health_command))
     app.add_handler(CommandHandler("reload", reload_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, process_message))
+    app.add_handler(MessageHandler(filters.Document.ALL, process_document))
     app.add_handler(CallbackQueryHandler(button_click))
     app.add_error_handler(error_handler)
 
